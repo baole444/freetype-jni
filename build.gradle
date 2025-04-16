@@ -1,0 +1,222 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'signing'
+    id 'org.graalvm.buildtools.native' version '0.9.28'
+    id 'de.undercouch.download' version '5.5.0'
+}
+
+group = 'com.mlomb'
+version = '2.0.0'
+description = 'Java bindings for the FreeType font rendering library'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    withJavadocJar()
+    withSourcesJar()
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // For testing
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.0'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.0'
+
+    // For loading native libraries
+    implementation 'org.scijava:native-lib-loader:2.4.0'
+}
+
+// Testing configuration
+test {
+    useJUnitPlatform()
+    jvmArgs = ['--enable-native-access=ALL-UNNAMED', '--enable-preview']
+}
+
+// Compilation options
+tasks.withType(JavaCompile) {
+    options.compilerArgs += ['--enable-preview', '--enable-native-access=ALL-UNNAMED']
+}
+
+// FreeType version to use
+def freetypeVersion = '2.13.3'
+def freetypeArchiveUrl = "https://download.savannah.gnu.org/releases/freetype/freetype-${freetypeVersion}.tar.gz"
+def freetypeSrcDir = "${buildDir}/freetype-src"
+def freetypeBuildDir = "${buildDir}/freetype-build"
+def generatedHeadersDir = "${buildDir}/generated/jni-headers"
+
+// Define operating systems and architectures to build for
+def osArchPairs = [
+        ['linux', 'x86_64', '.so'],
+        ['windows', 'x86_64', '.dll'],
+        ['mac', 'x86_64', '.dylib'],
+        ['mac', 'aarch64', '.dylib']
+]
+
+// Download and extract FreeType source code
+task downloadFreetype(type: de.undercouch.gradle.tasks.download.Download) {
+    src freetypeArchiveUrl
+    dest "${buildDir}/freetype-${freetypeVersion}.tar.gz"
+}
+
+task extractFreetype(dependsOn: downloadFreetype, type: Copy) {
+    from tarTree(downloadFreetype.dest)
+    into "${buildDir}"
+    doLast {
+        file("${buildDir}/freetype-${freetypeVersion}").renameTo(file(freetypeSrcDir))
+    }
+}
+
+// Generate JNI headers from Java classes
+task generateJniHeaders(type: JavaCompile) {
+    source = sourceSets.main.java
+    classpath = sourceSets.main.compileClasspath
+    destinationDirectory = file("${buildDir}/tmp/jni-classes")
+    options.compilerArgs = [
+            '-h', generatedHeadersDir
+    ]
+}
+
+// Configure CMAKE for each platform/architecture
+osArchPairs.each { platform ->
+    def os = platform[0]
+    def arch = platform[1]
+    def extension = platform[2]
+    def taskName = "compileFreeType${os.capitalize()}${arch.capitalize()}"
+
+    task "$taskName"(dependsOn: [extractFreetype, generateJniHeaders], type: Exec) {
+        def outDir = "${freetypeBuildDir}/${os}-${arch}"
+
+        doFirst {
+            mkdir outDir
+        }
+
+        workingDir outDir
+
+        // Use appropriate cmake generator based on platform
+        def cmakeGen = os == 'windows' ? 'NMake Makefiles' : 'Ninja'
+
+        // Configure cross-compilation if needed
+        def cmakeArgs = [
+                'cmake',
+                '-DCMAKE_BUILD_TYPE=Release',
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                "-DBUILD_SHARED_LIBS=OFF",
+                "-DCMAKE_C_FLAGS=-fPIC",
+                "-DJNI_HEADERS_DIR=${generatedHeadersDir}",
+                "-G", cmakeGen,
+                "${freetypeSrcDir}"
+        ]
+
+        if (os == 'windows' && !System.getProperty('os.name').toLowerCase().contains('win')) {
+            // Cross-compile for Windows from non-Windows
+            cmakeArgs.add("-DCMAKE_SYSTEM_NAME=Windows")
+            cmakeArgs.add("-DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc")
+        } else if (os == 'linux' && !System.getProperty('os.name').toLowerCase().contains('linux')) {
+            // Cross-compile for Linux from non-Linux
+            cmakeArgs.add("-DCMAKE_SYSTEM_NAME=Linux")
+        } else if (os == 'mac' && arch == 'aarch64' && System.getProperty('os.arch') != 'aarch64') {
+            // Cross-compile for Apple Silicon from Intel Mac
+            cmakeArgs.add("-DCMAKE_SYSTEM_NAME=Darwin")
+            cmakeArgs.add("-DCMAKE_OSX_ARCHITECTURES=arm64")
+        }
+
+        // Execute CMAKE
+        commandLine cmakeArgs
+    }
+
+    task "buildFreeType${os.capitalize()}${arch.capitalize()}"(dependsOn: taskName, type: Exec) {
+        workingDir "${freetypeBuildDir}/${os}-${arch}"
+        commandLine 'cmake', '--build', '.', '--config', 'Release'
+    }
+
+    task "buildJni${os.capitalize()}${arch.capitalize()}"(
+            dependsOn: "buildFreeType${os.capitalize()}${arch.capitalize()}",
+            type: Exec) {
+        workingDir "${freetypeBuildDir}/${os}-${arch}"
+
+        // Compile the JNI code
+        commandLine 'c++', '-shared', '-fPIC',
+                "-I${generatedHeadersDir}",
+                "-I${freetypeSrcDir}/include",
+                "-I${System.getProperty('java.home')}/include",
+                "-I${System.getProperty('java.home')}/include/${os.toLowerCase()}",
+                "-o", "libfreetype-jni${extension}",
+                "${projectDir}/jni/freetype_jni.cpp",
+                "-L${freetypeBuildDir}/${os}-${arch}/lib",
+                "-lfreetype"
+    }
+
+    task "copyJniLib${os.capitalize()}${arch.capitalize()}"(
+            dependsOn: "buildJni${os.capitalize()}${arch.capitalize()}",
+            type: Copy) {
+        from "${freetypeBuildDir}/${os}-${arch}/libfreetype-jni${extension}"
+        into "${buildDir}/resources/main/lib/${os}-${arch}"
+    }
+
+    // Add these platform-specific tasks to the main build
+    build.dependsOn "copyJniLib${os.capitalize()}${arch.capitalize()}"
+}
+
+// Publishing to Maven Central
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+
+            pom {
+                name = 'FreeType JNI'
+                packaging = 'jar'
+                description = project.description
+                url = 'https://github.com/mlomb/freetype-jni'
+
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url = 'http://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+
+                developers {
+                    developer {
+                        name = 'Martín Lombardo'
+                        email = 'mlomb@example.com'
+                        organizationUrl = 'https://github.com/mlomb'
+                    }
+                }
+
+                scm {
+                    connection = 'scm:git:git://github.com/mlomb/freetype-jni.git'
+                    developerConnection = 'scm:git:ssh://github.com:mlomb/freetype-jni.git'
+                    url = 'https://github.com/mlomb/freetype-jni/tree/main'
+                }
+            }
+        }
+    }
+
+    repositories {
+        maven {
+            name = 'OSSRH'
+            def releasesRepoUrl = 'https://oss.sonatype.org/service/local/staging/deploy/maven2/'
+            def snapshotsRepoUrl = 'https://oss.sonatype.org/content/repositories/snapshots/'
+            url = version.endsWith('SNAPSHOT') ? snapshotsRepoUrl : releasesRepoUrl
+            credentials {
+                username = findProperty('ossrhUsername') ?: System.getenv('OSSRH_USERNAME')
+                password = findProperty('ossrhPassword') ?: System.getenv('OSSRH_PASSWORD')
+            }
+        }
+    }
+}
+
+// Signing artifacts for Maven Central
+signing {
+    sign publishing.publications.mavenJava
+    required { !version.endsWith('SNAPSHOT') && gradle.taskGraph.hasTask("publish") }
+}
+
+// Run the native build only when packaging the JAR
+jar.dependsOn build
