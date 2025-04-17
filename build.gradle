@@ -1,25 +1,29 @@
+import de.undercouch.gradle.tasks.download.Download
+
 plugins {
     id 'java-library'
-    id 'maven-publish'
-    id 'signing'
-    id 'org.graalvm.buildtools.native' version '0.9.28'
-    id 'de.undercouch.download' version '5.5.0'
+    id 'de.undercouch.download' version '5.6.0'
 }
 
+
+
 group = 'com.mlomb'
-version = '2.0.0'
+version = '1.0.0'
 description = 'Java bindings for the FreeType font rendering library'
+def buildDirectory = "${getLayout().getBuildDirectory()}"
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
+        languageVersion = JavaLanguageVersion.of(8)
     }
-    withJavadocJar()
-    withSourcesJar()
 }
 
 repositories {
     mavenCentral()
+
+    maven {
+        url "https://repo.gradle.org/gradle/jvm-ecosystem-repository"
+    }
 }
 
 dependencies {
@@ -34,48 +38,41 @@ dependencies {
 // Testing configuration
 test {
     useJUnitPlatform()
-    jvmArgs = ['--enable-native-access=ALL-UNNAMED', '--enable-preview']
 }
 
-// Compilation options
-tasks.withType(JavaCompile) {
-    options.compilerArgs += ['--enable-preview', '--enable-native-access=ALL-UNNAMED']
-}
-
-// FreeType version to use
-def freetypeVersion = '2.13.3'
+// FreeType version to use - starting with 2.9.1 for compatibility
+def freetypeVersion = '2.9.1'
 def freetypeArchiveUrl = "https://download.savannah.gnu.org/releases/freetype/freetype-${freetypeVersion}.tar.gz"
-def freetypeSrcDir = "${buildDir}/freetype-src"
-def freetypeBuildDir = "${buildDir}/freetype-build"
-def generatedHeadersDir = "${buildDir}/generated/jni-headers"
+def freetypeSrcDir = "${buildDirectory}/freetype-src"
+def freetypeBuildDir = "${buildDirectory}/freetype-build"
+def generatedHeadersDir = "${buildDirectory}/generated/jni-headers"
 
 // Define operating systems and architectures to build for
 def osArchPairs = [
         ['linux', 'x86_64', '.so'],
         ['windows', 'x86_64', '.dll'],
-        ['mac', 'x86_64', '.dylib'],
-        ['mac', 'aarch64', '.dylib']
+        ['mac', 'x86_64', '.dylib']
 ]
 
-// Download and extract FreeType source code
-task downloadFreetype(type: de.undercouch.gradle.tasks.download.Download) {
+tasks.register('downloadFreetype', Download) {
     src freetypeArchiveUrl
-    dest "${buildDir}/freetype-${freetypeVersion}.tar.gz"
+    dest "${buildDirectory}/freetype-${freetypeVersion}.tar.gz"
 }
 
-task extractFreetype(dependsOn: downloadFreetype, type: Copy) {
+tasks.register('extractFreetype', Copy) {
+    dependsOn downloadFreetype
     from tarTree(downloadFreetype.dest)
-    into "${buildDir}"
+    into "${getLayout().getBuildDirectory()}"
     doLast {
-        file("${buildDir}/freetype-${freetypeVersion}").renameTo(file(freetypeSrcDir))
+        file("${buildDirectory}/freetype-${freetypeVersion}").renameTo(file(freetypeSrcDir))
     }
 }
 
 // Generate JNI headers from Java classes
-task generateJniHeaders(type: JavaCompile) {
+tasks.register('generateJniHeaders', JavaCompile) {
     source = sourceSets.main.java
     classpath = sourceSets.main.compileClasspath
-    destinationDirectory = file("${buildDir}/tmp/jni-classes")
+    destinationDirectory = file("${buildDirectory}/tmp/jni-classes")
     options.compilerArgs = [
             '-h', generatedHeadersDir
     ]
@@ -88,7 +85,8 @@ osArchPairs.each { platform ->
     def extension = platform[2]
     def taskName = "compileFreeType${os.capitalize()}${arch.capitalize()}"
 
-    task "$taskName"(dependsOn: [extractFreetype, generateJniHeaders], type: Exec) {
+    tasks.register(taskName, Exec) {
+        dependsOn(extractFreetype, generateJniHeaders)  // Fixed: use parentheses instead of square brackets
         def outDir = "${freetypeBuildDir}/${os}-${arch}"
 
         doFirst {
@@ -98,7 +96,7 @@ osArchPairs.each { platform ->
         workingDir outDir
 
         // Use appropriate cmake generator based on platform
-        def cmakeGen = os == 'windows' ? 'NMake Makefiles' : 'Ninja'
+        def cmakeGen = os == 'windows' ? 'NMake Makefiles' : 'Unix Makefiles'
 
         // Configure cross-compilation if needed
         def cmakeArgs = [
@@ -107,116 +105,191 @@ osArchPairs.each { platform ->
                 "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
                 "-DBUILD_SHARED_LIBS=OFF",
                 "-DCMAKE_C_FLAGS=-fPIC",
-                "-DJNI_HEADERS_DIR=${generatedHeadersDir}",
-                "-G", cmakeGen,
                 "${freetypeSrcDir}"
         ]
 
-        if (os == 'windows' && !System.getProperty('os.name').toLowerCase().contains('win')) {
-            // Cross-compile for Windows from non-Windows
-            cmakeArgs.add("-DCMAKE_SYSTEM_NAME=Windows")
-            cmakeArgs.add("-DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc")
-        } else if (os == 'linux' && !System.getProperty('os.name').toLowerCase().contains('linux')) {
-            // Cross-compile for Linux from non-Linux
-            cmakeArgs.add("-DCMAKE_SYSTEM_NAME=Linux")
-        } else if (os == 'mac' && arch == 'aarch64' && System.getProperty('os.arch') != 'aarch64') {
-            // Cross-compile for Apple Silicon from Intel Mac
-            cmakeArgs.add("-DCMAKE_SYSTEM_NAME=Darwin")
-            cmakeArgs.add("-DCMAKE_OSX_ARCHITECTURES=arm64")
+        if (cmakeGen) {
+            cmakeArgs.addAll(["-G", cmakeGen])
         }
 
         // Execute CMAKE
         commandLine cmakeArgs
     }
 
-    task "buildFreeType${os.capitalize()}${arch.capitalize()}"(dependsOn: taskName, type: Exec) {
+    tasks.register("buildFreeType${os.capitalize()}${arch.capitalize()}", Exec) {
+        dependsOn taskName
         workingDir "${freetypeBuildDir}/${os}-${arch}"
         commandLine 'cmake', '--build', '.', '--config', 'Release'
     }
 
-    task "buildJni${os.capitalize()}${arch.capitalize()}"(
-            dependsOn: "buildFreeType${os.capitalize()}${arch.capitalize()}",
-            type: Exec) {
+    tasks.register("buildJni${os.capitalize()}${arch.capitalize()}", Exec) {
+        dependsOn "buildFreeType${os.capitalize()}${arch.capitalize()}"
         workingDir "${freetypeBuildDir}/${os}-${arch}"
 
         // Compile the JNI code
-        commandLine 'c++', '-shared', '-fPIC',
-                "-I${generatedHeadersDir}",
-                "-I${freetypeSrcDir}/include",
-                "-I${System.getProperty('java.home')}/include",
-                "-I${System.getProperty('java.home')}/include/${os.toLowerCase()}",
-                "-o", "libfreetype-jni${extension}",
-                "${projectDir}/jni/freetype_jni.cpp",
-                "-L${freetypeBuildDir}/${os}-${arch}/lib",
-                "-lfreetype"
+        def compileCmd = []
+        if (os == 'windows') {
+            compileCmd = ['cl', '/LD',
+                          "/I${generatedHeadersDir}",
+                          "/I${freetypeSrcDir}/include",
+                          "/I${System.getProperty('java.home')}/include",
+                          "/I${System.getProperty('java.home')}/include/win32",
+                          "${projectDir}/jni/freetype_jni.cpp",
+                          "/link", "/LIBPATH:${freetypeBuildDir}/${os}-${arch}/lib",
+                          "freetype.lib", "/OUT:freetype-jni${extension}"]
+        } else {
+            compileCmd = ['c++', '-shared', '-fPIC',
+                          "-I${generatedHeadersDir}",
+                          "-I${freetypeSrcDir}/include",
+                          "-I${System.getProperty('java.home')}/include",
+                          "-I${System.getProperty('java.home')}/include/${os == 'mac' ? 'darwin' : os.toLowerCase()}",
+                          "-o", "libfreetype-jni${extension}",
+                          "${projectDir}/jni/freetype_jni.cpp",
+                          "-L${freetypeBuildDir}/${os}-${arch}/lib",
+                          "-lfreetype"]
+        }
+
+        commandLine compileCmd
     }
 
-    task "copyJniLib${os.capitalize()}${arch.capitalize()}"(
-            dependsOn: "buildJni${os.capitalize()}${arch.capitalize()}",
-            type: Copy) {
+    tasks.register("copyJniLib${os.capitalize()}${arch.capitalize()}", Copy) {
+        dependsOn "buildJni${os.capitalize()}${arch.capitalize()}"
         from "${freetypeBuildDir}/${os}-${arch}/libfreetype-jni${extension}"
-        into "${buildDir}/resources/main/lib/${os}-${arch}"
+        into "${buildDirectory}/resources/main/native/${os}-${arch}"
     }
 
     // Add these platform-specific tasks to the main build
-    build.dependsOn "copyJniLib${os.capitalize()}${arch.capitalize()}"
+    tasks.build.dependsOn "copyJniLib${os.capitalize()}${arch.capitalize()}"
 }
 
-// Publishing to Maven Central
-publishing {
-    publications {
-        mavenJava(MavenPublication) {
-            from components.java
 
-            pom {
-                name = 'FreeType JNI'
-                packaging = 'jar'
-                description = project.description
-                url = 'https://github.com/mlomb/freetype-jni'
+// Create a native library loader class
+tasks.register('generateNativeLoader') {
+    doLast {
+        def outputDir = "${buildDir}/generated/sources/java/com/mlomb/freetypejni/internal"
+        mkdir outputDir
 
-                licenses {
-                    license {
-                        name = 'The Apache License, Version 2.0'
-                        url = 'http://www.apache.org/licenses/LICENSE-2.0.txt'
-                    }
-                }
+        def loaderFile = new File("${outputDir}/NativeLoader.java")
+        loaderFile.text = """package com.mlomb.freetypejni.internal;
 
-                developers {
-                    developer {
-                        name = 'Martín Lombardo'
-                        email = 'mlomb@example.com'
-                        organizationUrl = 'https://github.com/mlomb'
-                    }
-                }
+import org.scijava.native_lib_loader.NativeLibraryUtil;
 
-                scm {
-                    connection = 'scm:git:git://github.com/mlomb/freetype-jni.git'
-                    developerConnection = 'scm:git:ssh://github.com:mlomb/freetype-jni.git'
-                    url = 'https://github.com/mlomb/freetype-jni/tree/main'
-                }
-            }
-        }
-    }
-
-    repositories {
-        maven {
-            name = 'OSSRH'
-            def releasesRepoUrl = 'https://oss.sonatype.org/service/local/staging/deploy/maven2/'
-            def snapshotsRepoUrl = 'https://oss.sonatype.org/content/repositories/snapshots/'
-            url = version.endsWith('SNAPSHOT') ? snapshotsRepoUrl : releasesRepoUrl
-            credentials {
-                username = findProperty('ossrhUsername') ?: System.getenv('OSSRH_USERNAME')
-                password = findProperty('ossrhPassword') ?: System.getenv('OSSRH_PASSWORD')
-            }
+/**
+ * Utility class for loading native libraries
+ */
+public class NativeLoader {
+    private static boolean loaded = false;
+    
+    /**
+     * Loads the native library
+     */
+    public static synchronized void loadLibrary() {
+        if (!loaded) {
+            NativeLibraryUtil.loadLibrary("freetype-jni");
+            loaded = true;
         }
     }
 }
-
-// Signing artifacts for Maven Central
-signing {
-    sign publishing.publications.mavenJava
-    required { !version.endsWith('SNAPSHOT') && gradle.taskGraph.hasTask("publish") }
+"""
+    }
 }
 
-// Run the native build only when packaging the JAR
-jar.dependsOn build
+// Task to generate Gradle wrapper with specific version
+tasks.register('createWrapper') {
+    description = 'Creates Gradle wrapper files with version 8.13'
+    group = 'Build Setup'
+
+    doLast {
+        // Execute the Gradle wrapper task programmatically
+        tasks.wrapper.configure {
+            gradleVersion = '8.13'
+            distributionType = Wrapper.DistributionType.ALL
+        }
+        tasks.wrapper.execute()
+
+        println "Gradle wrapper ${gradleVersion} has been generated"
+        println "  - You can now use './gradlew' instead of 'gradle'"
+    }
+}
+
+// Add a task to verify the toolchain
+tasks.register('verifyToolchain') {
+    description = 'Verifies that the Java toolchain is properly configured'
+    group = 'Build'
+
+    doLast {
+        // Get the Java compilation task
+        def javaCompileTask = tasks.compileJava
+
+        // Get the toolchain JDK
+        def toolchainJdk = javaCompileTask.javaCompiler.orNull?.metadata
+
+        if (toolchainJdk) {
+            println "Toolchain configured successfully"
+            println "  - Java version: ${toolchainJdk.languageVersion.asInt()}"
+            println "  - Vendor: ${toolchainJdk.vendor.toString()}"
+        } else {
+            println "No toolchain is configured or available"
+            println "  - Falling back to: Java ${System.getProperty('java.version')}"
+        }
+    }
+}
+
+// Custom build task that executes the whole build process
+tasks.register('fullBuild') {
+    description = 'Executes the complete build process including compilation and native library building'
+    group = 'Build'
+
+    // This task depends on the standard build task which includes
+    // compiling, testing, and creating the jar
+    dependsOn tasks.build, tasks.verifyToolchain
+
+    // Make sure verifyToolchain runs before build to show info first
+    tasks.build.mustRunAfter tasks.verifyToolchain
+
+    doFirst {
+        println "Starting full build process for FreeType JNI"
+        println "  - Building with specified Java toolchain"
+        println "  - OS: ${System.getProperty('os.name')}"
+        println "  - FreeType version: ${freetypeVersion}"
+    }
+
+    doLast {
+        // Get the output JAR file
+        def jarFile = tasks.jar.archiveFile.get().asFile
+        def jarSizeKB = jarFile.length() / 1024
+
+        println "Build completed successfully"
+        println "  - Output: ${jarFile.name} (${String.format('%.2f', jarSizeKB)} KB)"
+        println "  - Native libraries included for: ${osArchPairs.collect { it[0] + '-' + it[1] }.join(', ')}"
+        println "  - The library is now ready to use"
+    }
+}
+
+// Add a task to clean and then build
+tasks.register('cleanAndBuild') {
+    description = 'Cleans the project and then performs a full build'
+    group = 'Build'
+
+    dependsOn tasks.clean, tasks.fullBuild
+
+    // Ensure clean runs before build
+    tasks.findByName('fullBuild').mustRunAfter tasks.clean
+}
+
+// Configure compile task to show more information
+tasks.compileJava.doFirst {
+    println "Compiling with toolchain: ${javaCompiler.get().metadata.languageVersion.asInt()}"
+}
+
+
+// Add the generated source to the main source set
+sourceSets {
+    main {
+        java {
+            srcDir "${buildDir}/generated/sources/java"
+        }
+    }
+}
+
+compileJava.dependsOn generateNativeLoader
