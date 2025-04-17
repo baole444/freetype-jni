@@ -32,7 +32,7 @@ dependencies {
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.0'
 
     // For loading native libraries
-    implementation 'org.scijava:native-lib-loader:2.4.0'
+    implementation "org.scijava:native-lib-loader:${nativelib_version}"
 }
 
 // Testing configuration

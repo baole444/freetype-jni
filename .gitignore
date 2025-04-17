@@ -7,3 +7,4 @@ intermediates/
 # idea
 .idea
 .gradle
+/releases/
