@@ -10,7 +10,11 @@ plugins {
 group = 'com.mlomb'
 version = '1.0.0'
 description = 'Java bindings for the FreeType font rendering library'
-def buildDirectory = "${getLayout().getBuildDirectory()}"
+
+def getBuildDir() {
+    return layout.buildDirectory.get().asFile
+}
+
 
 java {
     toolchain {
@@ -20,7 +24,6 @@ java {
 
 repositories {
     mavenCentral()
-
     maven {
         url "https://repo.gradle.org/gradle/jvm-ecosystem-repository"
     }
@@ -32,7 +35,7 @@ dependencies {
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.0'
 
     // For loading native libraries
-    implementation "org.scijava:native-lib-loader:${nativelib_version}"
+    implementation("org.scijava:native-lib-loader:${nativelib_version}")
 }
 
 // Testing configuration
@@ -42,9 +45,9 @@ test {
 
 // FreeType version to use - starting with 2.9.1 for compatibility
 def freetypeArchiveUrl = "https://download.savannah.gnu.org/releases/freetype/freetype-${freetype_version}.tar.gz"
-def freetypeSrcDir = "${buildDirectory}/freetype-src"
-def freetypeBuildDir = "${buildDirectory}/freetype-build"
-def generatedHeadersDir = "${buildDirectory}/generated/jni-headers"
+def freetypeSrcDir = new File(getBuildDir(), "freetype-src")
+def freetypeBuildDir = new File(getBuildDir(), "freetype-build")
+def generatedHeadersDir = new File(getBuildDir(), "generated/jni-headers")
 
 // Define operating systems and architectures to build for
 def osArchPairs = [
@@ -55,15 +58,17 @@ def osArchPairs = [
 
 tasks.register('downloadFreetype', Download) {
     src freetypeArchiveUrl
-    dest "${buildDirectory}/freetype-${freetype_version}.tar.gz"
+    dest new File(getBuildDir(), "freetype-${freetype_version}.tar.gz")
 }
+
+def freetypeExtractDir = new File(this.getBuildDir(), "freetype-extract")
 
 tasks.register('extractFreetype', Copy) {
     dependsOn downloadFreetype
     from tarTree(downloadFreetype.dest)
-    into "${getLayout().getBuildDirectory()}"
+    into freetypeExtractDir
     doLast {
-        file("${buildDirectory}/freetype-${freetype_version}").renameTo(file(freetypeSrcDir))
+        new File(freetypeExtractDir, "freetype-${freetype_version}").renameTo(freetypeSrcDir)
     }
 }
 
@@ -71,10 +76,22 @@ tasks.register('extractFreetype', Copy) {
 tasks.register('generateJniHeaders', JavaCompile) {
     source = sourceSets.main.java
     classpath = sourceSets.main.compileClasspath
-    destinationDirectory = file("${buildDirectory}/tmp/jni-classes")
+    destinationDirectory = file(new File(getBuildDir(), "tmp/jni-classes"))
     options.compilerArgs = [
-            '-h', generatedHeadersDir
+            '-h', generatedHeadersDir.path
     ]
+}
+
+tasks.named("compileJava") {
+    dependsOn extractFreetype
+}
+
+tasks.named("jar") {
+    dependsOn extractFreetype
+}
+
+tasks.named("generateJniHeaders") {
+    dependsOn extractFreetype
 }
 
 // Configure CMAKE for each platform/architecture
@@ -85,8 +102,8 @@ osArchPairs.each { platform ->
     def taskName = "compileFreeType${os.capitalize()}${arch.capitalize()}"
 
     tasks.register(taskName, Exec) {
-        dependsOn(extractFreetype, generateJniHeaders)  // Fixed: use parentheses instead of square brackets
-        def outDir = "${freetypeBuildDir}/${os}-${arch}"
+        dependsOn(extractFreetype, generateJniHeaders)
+        def outDir = new File(freetypeBuildDir, "${os}-${arch}")
 
         doFirst {
             mkdir outDir
@@ -104,7 +121,7 @@ osArchPairs.each { platform ->
                 "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
                 "-DBUILD_SHARED_LIBS=OFF",
                 "-DCMAKE_C_FLAGS=-fPIC",
-                "${freetypeSrcDir}"
+                freetypeSrcDir.path
         ]
 
         if (cmakeGen) {
@@ -117,44 +134,51 @@ osArchPairs.each { platform ->
 
     tasks.register("buildFreeType${os.capitalize()}${arch.capitalize()}", Exec) {
         dependsOn taskName
-        workingDir "${freetypeBuildDir}/${os}-${arch}"
+        workingDir new File(freetypeBuildDir, "${os}-${arch}")
         commandLine 'cmake', '--build', '.', '--config', 'Release'
     }
 
+    // Updated path to JNI source file
+    def jniSourcePath = new File(projectDir, "src/main/native/freetype_jni.cpp").path
+
     tasks.register("buildJni${os.capitalize()}${arch.capitalize()}", Exec) {
         dependsOn "buildFreeType${os.capitalize()}${arch.capitalize()}"
-        workingDir "${freetypeBuildDir}/${os}-${arch}"
+        workingDir new File(freetypeBuildDir, "${os}-${arch}")
 
         // Compile the JNI code
         def compileCmd = []
         if (os == 'windows') {
             compileCmd = ['cl', '/LD',
-                          "/I${generatedHeadersDir}",
-                          "/I${freetypeSrcDir}/include",
+                          "/I${generatedHeadersDir.path}",
+                          "/I${new File(freetypeSrcDir, "include").path}",
                           "/I${System.getProperty('java.home')}/include",
                           "/I${System.getProperty('java.home')}/include/win32",
-                          "${projectDir}/jni/freetype_jni.cpp",
-                          "/link", "/LIBPATH:${freetypeBuildDir}/${os}-${arch}/lib",
+                          jniSourcePath,
+                          "/link", "/LIBPATH:${new File(freetypeBuildDir, "${os}-${arch}/lib").path}",
                           "freetype.lib", "/OUT:freetype-jni${extension}"]
         } else {
             compileCmd = ['c++', '-shared', '-fPIC',
-                          "-I${generatedHeadersDir}",
-                          "-I${freetypeSrcDir}/include",
+                          "-I${generatedHeadersDir.path}",
+                          "-I${new File(freetypeSrcDir, "include").path}",
                           "-I${System.getProperty('java.home')}/include",
                           "-I${System.getProperty('java.home')}/include/${os == 'mac' ? 'darwin' : os.toLowerCase()}",
                           "-o", "libfreetype-jni${extension}",
-                          "${projectDir}/jni/freetype_jni.cpp",
-                          "-L${freetypeBuildDir}/${os}-${arch}/lib",
+                          jniSourcePath,
+                          "-L${new File(freetypeBuildDir, "${os}-${arch}/lib").path}",
                           "-lfreetype"]
         }
 
         commandLine compileCmd
+
+        doFirst {
+            println "Building JNI library for ${os}-${arch} using source: ${jniSourcePath}"
+        }
     }
 
     tasks.register("copyJniLib${os.capitalize()}${arch.capitalize()}", Copy) {
         dependsOn "buildJni${os.capitalize()}${arch.capitalize()}"
-        from "${freetypeBuildDir}/${os}-${arch}/libfreetype-jni${extension}"
-        into "${buildDirectory}/resources/main/native/${os}-${arch}"
+        from new File(freetypeBuildDir, "${os}-${arch}/libfreetype-jni${extension}")
+        into new File(getBuildDir(), "resources/main/native/${os}-${arch}")
     }
 
     // Add these platform-specific tasks to the main build
@@ -165,13 +189,13 @@ osArchPairs.each { platform ->
 // Create a native library loader class
 tasks.register('generateNativeLoader') {
     doLast {
-        def outputDir = "${buildDir}/generated/sources/java/com/mlomb/freetypejni/internal"
+        def outputDir = new File(getBuildDir(), "generated/sources/java/com/mlomb/freetypejni/internal")
         mkdir outputDir
 
-        def loaderFile = new File("${outputDir}/NativeLoader.java")
+        def loaderFile = new File(outputDir, "NativeLoader.java")
         loaderFile.text = """package com.mlomb.freetypejni.internal;
 
-import org.scijava.native_lib_loader.NativeLibraryUtil;
+import java.io.IOException;
 
 /**
  * Utility class for loading native libraries
@@ -184,8 +208,14 @@ public class NativeLoader {
      */
     public static synchronized void loadLibrary() {
         if (!loaded) {
-            NativeLibraryUtil.loadLibrary("freetype-jni");
-            loaded = true;
+            try {
+                org.scijava.nativelib.NativeLoader.loadLibrary("freetype-jni");
+                loaded = true;
+            } catch (IOException | SecurityException e) {
+                loaded = false;
+                System.err.println("Failed to load native library: " + e.getMessage());
+            }
+
         }
     }
 }
@@ -207,11 +237,10 @@ tasks.register('createWrapper') {
         tasks.wrapper.execute()
 
         println "Gradle wrapper ${gradleVersion} has been generated"
-        println "  - You can now use './gradlew' instead of 'gradle'"
     }
 }
 
-// Add a task to verify the toolchain
+// Task to verify the toolchain
 tasks.register('verifyToolchain') {
     description = 'Verifies that the Java toolchain is properly configured'
     group = 'Build'
@@ -234,7 +263,7 @@ tasks.register('verifyToolchain') {
     }
 }
 
-// Custom build task that executes the whole build process
+// Custom build task that executes the build process
 tasks.register('fullBuild') {
     description = 'Executes the complete build process including compilation and native library building'
     group = 'Build'
@@ -250,7 +279,7 @@ tasks.register('fullBuild') {
         println "Starting full build process for FreeType JNI"
         println "  - Building with specified Java toolchain"
         println "  - OS: ${System.getProperty('os.name')}"
-        println "  - FreeType version: ${freetype_version}"
+        println "  - FreeType version: ${project.freetype_version}"
     }
 
     doLast {
@@ -265,7 +294,7 @@ tasks.register('fullBuild') {
     }
 }
 
-// Add a task to clean and then build
+// Task to clean and then build
 tasks.register('cleanAndBuild') {
     description = 'Cleans the project and then performs a full build'
     group = 'Build'
@@ -281,12 +310,10 @@ tasks.compileJava.doFirst {
     println "Compiling with toolchain: ${javaCompiler.get().metadata.languageVersion.asInt()}"
 }
 
-
-// Add the generated source to the main source set
 sourceSets {
     main {
         java {
-            srcDirs = ['src/main/java', "${buildDirectory}/generated/sources/java"]
+            srcDirs = ['src/main/java', new File(this.getBuildDir(), "generated/sources/java")]
         }
         resources {
             srcDirs = ['src/main/resources']
